@@ -3,6 +3,7 @@
 int main(void)
 {
     ps3eye::camera::set_debug(true);
+    fprintf(stderr, "PS3EYEDriver %s\n", ps3eye::version_string);
 
     auto cameras = ps3eye::list_devices();
 

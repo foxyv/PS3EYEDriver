@@ -25,6 +25,10 @@ extern volatile bool _ps3eye_debug_status;
 
 namespace ps3eye {
 
+// Modified 2026 by foxyv: the -DIZ suffix marks this fork, distinct from the
+// official OpenTrack/inspirit driver.
+static constexpr inline const char* version_string = "1.0.0-DIZ";
+
 enum class resolution : uint8_t {
     QVGA,
     VGA,
