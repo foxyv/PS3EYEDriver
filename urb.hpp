@@ -1,3 +1,5 @@
+// Modified 2026 by foxyv: USB transfer error handling (no endless resubmit,
+// no close_transfers() from the callback, correct active-transfer count).
 #pragma once
 
 #include "queue.hpp"
@@ -5,6 +7,7 @@
 
 #include <mutex>
 #include <condition_variable>
+#include <atomic>
 
 struct libusb_device_handle;
 struct libusb_transfer;
@@ -29,7 +32,8 @@ struct urb_descriptor final
 
     bool start_transfers(libusb_device_handle* handle, uint32_t frame_size);
     void close_transfers();
-    void transfer_cancelled();
+    void transfer_retired();
+    void transfer_failed(int status);
     void frame_add(enum gspca_packet_type packet_type, const uint8_t* data, int len);
     void pkt_scan(uint8_t* data, int len);
 
@@ -49,6 +53,13 @@ struct urb_descriptor final
     uint16_t last_fid = 0;
     gspca_packet_type last_packet_type = DISCARD_PACKET;
     uint8_t num_active_transfers = 0;
+    unsigned consecutive_errors = 0;
+    bool streaming = false;
+    std::atomic<bool> stopping { false };
+
+    // Stop resubmitting after this many back-to-back failed transfers, so a
+    // misbehaving camera/port doesn't hammer the host controller.
+    static constexpr inline unsigned max_consecutive_errors = 25;
     std::array<uint8_t, transfer_size * num_transfers> transfer_buffer {};
 };
 

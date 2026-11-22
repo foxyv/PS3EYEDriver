@@ -1,3 +1,5 @@
+// Modified 2026 by foxyv: USB transfer error handling (no endless resubmit,
+// no close_transfers() from the callback, correct active-transfer count).
 #include "urb.hpp"
 #include "mgr.hpp"
 
@@ -26,23 +28,45 @@ static void LIBUSB_CALL transfer_completed_callback(struct libusb_transfer* xfr)
     urb_descriptor* urb = reinterpret_cast<urb_descriptor*>(xfr->user_data);
     enum libusb_transfer_status status = xfr->status;
 
-    if (status == LIBUSB_TRANSFER_CANCELLED)
-        return urb->transfer_cancelled();
-
-    if (status == LIBUSB_TRANSFER_COMPLETED)
-        urb->pkt_scan(xfr->buffer, xfr->actual_length);
-    else
+    switch (status)
     {
+    case LIBUSB_TRANSFER_COMPLETED:
+        urb->consecutive_errors = 0;
+        urb->pkt_scan(xfr->buffer, xfr->actual_length);
+        break;
+    case LIBUSB_TRANSFER_CANCELLED:
+        // close_transfers() asked for this; never resubmit.
+        return urb->transfer_retired();
+    case LIBUSB_TRANSFER_NO_DEVICE:
+    case LIBUSB_TRANSFER_STALL:
+        // Device is gone or the endpoint is halted. Resubmitting would
+        // fail (or STALL again) in a tight loop and can push the xHCI
+        // controller into resetting the port. Retire this transfer; the
+        // halt is cleared in start_transfers() on the next start.
+        ps3eye_debug("transfer error %d, retiring transfer", status);
+        urb->frame_add(DISCARD_PACKET, nullptr, 0);
+        return urb->transfer_failed(status);
+    default: // ERROR, TIMED_OUT, OVERFLOW
         ps3eye_debug("transfer error %d", status);
-        urb->frame_add(DISCARD_PACKET, NULL, 0);
+        urb->frame_add(DISCARD_PACKET, nullptr, 0);
+        if (++urb->consecutive_errors >= urb_descriptor::max_consecutive_errors)
+        {
+            ps3eye_debug("too many consecutive transfer errors, retiring transfer");
+            return urb->transfer_failed(status);
+        }
+        break;
     }
 
-    // debug("length:%u, actual_length:%u\n", xfr->length, xfr->actual_length);
+    if (urb->stopping)
+        return urb->transfer_retired();
 
     if (libusb_submit_transfer(xfr) < 0)
     {
+        // NOTE: never call close_transfers() here. This runs on the libusb
+        // event thread, and close_transfers() waits for cancellations that
+        // only this thread can deliver -> deadlock.
         ps3eye_debug("error re-submitting URB");
-        urb->close_transfers();
+        urb->transfer_failed(-1);
     }
 }
 
@@ -108,43 +132,58 @@ bool urb_descriptor::start_transfers(libusb_device_handle* handle, uint32_t fram
     // Allocate the transfer buffer
     memset(transfer_buffer.data(), 0, transfer_size * num_transfers);
 
-    int res = 0;
-    for (unsigned i = 0; i < num_transfers; ++i)
-    {
-        // Create & submit the transfer
-        xfr[i] = libusb_alloc_transfer(0);
-        libusb_fill_bulk_transfer(xfr[i], handle, bulk_endpoint,
-                                  transfer_buffer.data() + i * transfer_size, transfer_size, transfer_completed_callback,
-                                  reinterpret_cast<void*>(this), 0);
-
-        res |= libusb_submit_transfer(xfr[i]);
-
-        num_active_transfers++;
-    }
-
+    consecutive_errors = 0;
+    stopping = false;
     last_pts = 0;
     last_fid = 0;
+    last_packet_type = DISCARD_PACKET;
 
+    bool ok = true;
+    {
+        std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
+        for (unsigned i = 0; i < num_transfers; ++i)
+        {
+            // Create & submit the transfer
+            xfr[i] = libusb_alloc_transfer(0);
+            if (!xfr[i]) { ok = false; break; }
+            libusb_fill_bulk_transfer(xfr[i], handle, bulk_endpoint,
+                                      transfer_buffer.data() + i * transfer_size, transfer_size, transfer_completed_callback,
+                                      reinterpret_cast<void*>(this), 0);
+
+            // Only count transfers that were actually submitted, otherwise
+            // close_transfers() waits forever for callbacks that never come.
+            if (libusb_submit_transfer(xfr[i]) == 0)
+                num_active_transfers++;
+            else
+                ok = false;
+        }
+    }
+
+    streaming = true;
     usb_manager::instance().camera_started();
 
-    return res == 0;
+    return ok;
 }
 
 void urb_descriptor::close_transfers()
 {
     std::unique_lock<std::mutex> lock(num_active_transfers_mutex);
-    if (num_active_transfers == 0) return;
+    if (!streaming) return;
 
-    // Cancel any pending transfers
+    stopping = true;
+
+    // Cancel any pending transfers (already-retired ones just return NOT_FOUND)
     for (unsigned i = 0; i < num_transfers; ++i)
-        libusb_cancel_transfer(xfr[i]);
+        if (xfr[i])
+            libusb_cancel_transfer(xfr[i]);
 
-    // Wait for cancelation to finish
+    // Wait for every in-flight transfer to report back. The libusb event
+    // thread is still running at this point, so this can't deadlock.
     num_active_transfers_condition.wait(lock, [this]() {
         return num_active_transfers == 0;
     });
 
-    // Free completed transfers
+    // Free all transfers
     for (unsigned i = 0; i < num_transfers; ++i)
     {
         if (!xfr[i])
@@ -154,14 +193,26 @@ void urb_descriptor::close_transfers()
         xfr[i] = nullptr;
     }
 
+    streaming = false;
+    stopping = false;
+    lock.unlock();
     usb_manager::instance().camera_stopped();
 }
 
-void urb_descriptor::transfer_cancelled()
+void urb_descriptor::transfer_retired()
 {
     std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
-    --num_active_transfers;
+    if (num_active_transfers > 0)
+        --num_active_transfers;
     num_active_transfers_condition.notify_one();
+}
+
+void urb_descriptor::transfer_failed(int status)
+{
+    (void)status;
+    // The transfer is no longer in flight. The camera stops producing frames,
+    // and the caller's next stop/start cycle clears the halt and resubmits.
+    transfer_retired();
 }
 
 void urb_descriptor::frame_add(enum gspca_packet_type packet_type, const uint8_t* data, int len)
