@@ -199,6 +199,12 @@ void urb_descriptor::close_transfers()
     usb_manager::instance().camera_stopped();
 }
 
+bool urb_descriptor::any_active()
+{
+    std::lock_guard<std::mutex> lock(num_active_transfers_mutex);
+    return num_active_transfers > 0;
+}
+
 void urb_descriptor::transfer_retired()
 {
     std::lock_guard<std::mutex> lock(num_active_transfers_mutex);

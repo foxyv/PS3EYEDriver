@@ -1,6 +1,7 @@
 #pragma once
 
 #include "internal.hpp"
+#include <atomic>
 #include <climits>
 
 #include <cstdint>
@@ -21,6 +22,7 @@ struct frame_queue final
 
     [[nodiscard]]
     bool dequeue(uint8_t* dest, int W, int H, format fmt, bool flip_v);
+    void set_timeout_ms(int ms) { timeout_ms_ = ms; } // modified 2026 by foxyv
 
 private:
     static constexpr unsigned max_frame_size = 640*480;
@@ -34,6 +36,7 @@ private:
     unsigned head_ = 0;
     unsigned tail_ = 0;
     unsigned available_ = 0;
+    std::atomic<int> timeout_ms_ { 1000 };
 };
 
 } // ns ps3eye::detail

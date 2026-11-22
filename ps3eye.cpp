@@ -234,7 +234,50 @@ void camera::set_error(int code)
     }
 }
 
+// Modified 2026 by foxyv: init() recovers from a camera left in a bad state
+// (for example after USB sleep) with one rate-limited libusb_reset_device(),
+// the software equivalent of replugging. At most one reset per attempt and one
+// every 10 s, so it can never turn into a reset storm.
+bool camera::try_reset_device()
+{
+    using namespace std::chrono;
+    static std::atomic<long long> last_reset_ms { -1000000 };
+    const long long now = duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+    long long prev = last_reset_ms.load();
+    if (now - prev < 10000 || !last_reset_ms.compare_exchange_strong(prev, now))
+    {
+        ps3eye_debug("device reset skipped (rate limited)");
+        return false;
+    }
+
+    if (!handle_)
+        return false;
+
+    ps3eye_debug("camera in a bad state (%s), resetting device", error_string());
+    int res = libusb_reset_device(handle_);
+    // After a reset the handle may be invalid; reopen from scratch either way.
+    close_usb();
+    std::this_thread::sleep_for(500ms);
+    error_code_ = ERROR_OK;
+    if (res != 0)
+        ps3eye_debug("libusb_reset_device returned %d, reopening", res);
+    return open_usb();
+}
+
 bool camera::init(resolution res, int framerate, format fmt)
+{
+    if (init_impl(res, framerate, fmt))
+        return true;
+
+    // Opening worked but setup failed: try once to reset the device.
+    if (!handle_ && error_code_ == ERROR_OK)
+        return false;
+    if (!try_reset_device())
+        return false;
+    return init_impl(res, framerate, fmt);
+}
+
+bool camera::init_impl(resolution res, int framerate, format fmt)
 {
     set_error(ERROR_OK);
     stop();
@@ -280,7 +323,7 @@ bool camera::init(resolution res, int framerate, format fmt)
     ov534_reg_write(0xe0, 0x09);
     ov534_set_led(0);
 
-    return true;
+    return error_code_ == ERROR_OK;
 }
 
 bool camera::start()
@@ -403,6 +446,18 @@ int camera::bytes_per_pixel() const
     else if (format_ == format::Gray)
         return 1;
     return 0;
+}
+
+bool camera::healthy()
+{
+    if (error_code_ != ERROR_OK)
+        return false;
+    return !streaming_ || urb.any_active();
+}
+
+void camera::set_frame_timeout(int milliseconds)
+{
+    urb.queue.set_timeout_ms(milliseconds);
 }
 
 bool camera::get_frame(uint8_t* frame)

@@ -32,6 +32,7 @@ struct urb_descriptor final
 
     bool start_transfers(libusb_device_handle* handle, uint32_t frame_size);
     void close_transfers();
+    bool any_active();
     void transfer_retired();
     void transfer_failed(int status);
     void frame_add(enum gspca_packet_type packet_type, const uint8_t* data, int len);

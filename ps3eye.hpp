@@ -82,6 +82,14 @@ struct camera
     void set_saturation(int val);
 
     constexpr bool is_open() const { return streaming_; }
+
+    // Modified 2026 by foxyv. False once the stream has died: a control
+    // transfer failed, or every bulk transfer was retired after a stall or
+    // device-gone error. Callers should stop() and init() again (which does a
+    // rate-limited device reset if needed) instead of waiting on get_frame().
+    bool healthy();
+    // How long get_frame() waits for a frame before returning false (default 1000).
+    void set_frame_timeout(int milliseconds);
     constexpr bool is_initialized() const { return device_ && handle_; }
 
     constexpr libusb_device* device() const { return device_; }
@@ -118,6 +126,8 @@ private:
     static const ps3eye::detail::rate_s& _normalize_framerate(int fps, resolution res);
 
     void release();
+    [[nodiscard]] bool init_impl(resolution res, int framerate, format fmt);
+    [[nodiscard]] bool try_reset_device();
     [[nodiscard]] bool open_usb();
     void close_usb();
 
